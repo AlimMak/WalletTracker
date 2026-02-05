@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/api/solanarpc.ts","./src/components/balancecard.tsx","./src/components/tokenbalances.tsx","./src/components/txtable.tsx","./src/components/walletform.tsx","./src/utils/clipboard.ts","./src/utils/format.ts"],"version":"5.9.3"}

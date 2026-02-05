@@ -70,11 +70,18 @@ interface CachedTokenBalanceRow {
   accountCount: number;
 }
 
-interface CachedWalletData {
+interface StoredCachedWalletData {
   cachedAt: number;
   balanceSol: number | null;
   rows: CachedTxRow[];
   tokenBalances: CachedTokenBalanceRow[];
+}
+
+interface WalletCacheData {
+  cachedAt: number;
+  balanceSol: number | null;
+  rows: UiTxRow[];
+  tokenBalances: UiTokenBalanceRow[];
 }
 
 function validateWalletAddress(address: string): string | null {
@@ -241,7 +248,7 @@ function readWalletCache(
   walletAddress: string,
   endpoint: string,
   txLimit: number,
-): CachedWalletData | null {
+): WalletCacheData | null {
   if (typeof window === "undefined") {
     return null;
   }
@@ -259,7 +266,7 @@ function readWalletCache(
   }
 
   try {
-    const parsed = JSON.parse(raw) as Partial<CachedWalletData>;
+    const parsed = JSON.parse(raw) as Partial<StoredCachedWalletData>;
     if (typeof parsed.cachedAt !== "number" || Date.now() - parsed.cachedAt > CACHE_TTL_MS) {
       window.localStorage.removeItem(key);
       return null;
@@ -289,7 +296,7 @@ function writeWalletCache(
   }
 
   const key = getCacheKey(walletAddress, endpoint, txLimit);
-  const payload: CachedWalletData = {
+  const payload: StoredCachedWalletData = {
     cachedAt: Date.now(),
     balanceSol,
     rows: serializeTxRows(rows),
