@@ -1,12 +1,6 @@
 import { LAMPORTS_PER_SOL, lamportsToSol } from "../utils/format";
 
-export interface WalletInputState {
-  address: string;
-  isValid: boolean;
-  error: string | null;
-}
-
-export interface RpcResponse<T> {
+interface RpcResponse<T> {
   jsonrpc: "2.0";
   id: number | string | null;
   result?: T;
@@ -20,7 +14,7 @@ export interface RpcResponse<T> {
 export interface SignatureInfo {
   signature: string;
   slot: number;
-  err: Record<string, unknown> | null;
+  err: unknown | null;
   memo: string | null;
   blockTime: number | null;
   confirmationStatus?: "processed" | "confirmed" | "finalized" | null;
@@ -51,41 +45,20 @@ export interface TransactionDetail {
   } | null;
 }
 
+export type TxStatus = "success" | "fail" | "unknown";
+
+export type TxDirection = "incoming" | "outgoing" | "unknown";
+
 export interface UiTxRow {
   signature: string;
   time: Date | null;
-  status: "success" | "fail" | "unknown";
-  direction: "incoming" | "outgoing" | "unknown";
+  status: TxStatus;
+  direction: TxDirection;
   solChange: number | null;
   feeSol: number | null;
   slot: number | null;
   explorerUrl: string;
-}
-
-export interface TokenAccountByOwnerValue {
-  pubkey: string;
-  account: {
-    data?: {
-      parsed?: {
-        info?: {
-          mint?: string;
-          tokenAmount?: {
-            amount?: string;
-            decimals?: number;
-            uiAmount?: number | null;
-            uiAmountString?: string;
-          };
-        };
-      };
-    };
-  };
-}
-
-export interface UiTokenBalanceRow {
-  mint: string;
-  amount: string;
-  decimals: number;
-  accountCount: number;
+  detailUnavailable: boolean;
 }
 
 export class RpcRequestError extends Error {
@@ -114,6 +87,10 @@ export class RpcRequestError extends Error {
 
 let rpcRequestId = 0;
 
+export function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 async function rpcRequest<T>(
   endpoint: string,
   method: string,
@@ -128,10 +105,13 @@ async function rpcRequest<T>(
   };
 
   let response: Response;
+
   try {
     response = await fetch(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify(payload),
       signal,
     });
@@ -139,54 +119,50 @@ async function rpcRequest<T>(
     if (isAbortError(error)) {
       throw error;
     }
-    throw new RpcRequestError("Unable to reach RPC endpoint.", {
+
+    throw new RpcRequestError("Unable to connect to the selected RPC endpoint.", {
       isNetwork: true,
     });
   }
 
   if (response.status === 429) {
-    throw new RpcRequestError("RPC endpoint rate limited the request.", {
+    throw new RpcRequestError("RPC rate limit hit.", {
       httpStatus: 429,
       isRateLimit: true,
     });
   }
 
   if (!response.ok) {
-    throw new RpcRequestError(
-      `RPC endpoint returned HTTP ${response.status}.`,
-      {
-        httpStatus: response.status,
-      },
-    );
+    throw new RpcRequestError(`RPC returned HTTP ${response.status}.`, {
+      httpStatus: response.status,
+    });
   }
 
-  let parsed: RpcResponse<T>;
+  let json: RpcResponse<T>;
+
   try {
-    parsed = (await response.json()) as RpcResponse<T>;
+    json = (await response.json()) as RpcResponse<T>;
   } catch {
-    throw new RpcRequestError("RPC endpoint returned invalid JSON.");
+    throw new RpcRequestError("RPC returned an invalid JSON response.");
   }
 
-  if (parsed.error) {
+  if (json.error) {
     const maybeRateLimit =
-      parsed.error.code === 429 ||
-      parsed.error.code === -32005 ||
-      /rate|too many/i.test(parsed.error.message);
-    throw new RpcRequestError(parsed.error.message, {
-      code: parsed.error.code,
+      json.error.code === 429 ||
+      json.error.code === -32005 ||
+      /rate|too many|throttle/i.test(json.error.message);
+
+    throw new RpcRequestError(json.error.message, {
+      code: json.error.code,
       isRateLimit: maybeRateLimit,
     });
   }
 
-  if (typeof parsed.result === "undefined") {
+  if (typeof json.result === "undefined") {
     throw new RpcRequestError("RPC response did not include a result.");
   }
 
-  return parsed.result;
-}
-
-export function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
+  return json.result;
 }
 
 export async function getBalance(
@@ -200,6 +176,7 @@ export async function getBalance(
     [walletAddress, { commitment: "confirmed" }],
     signal,
   );
+
   return result.value;
 }
 
@@ -240,9 +217,7 @@ export async function getTransaction(
     if (
       error instanceof RpcRequestError &&
       (error.code === -32602 ||
-        /unsupported|version|maxsupportedtransactionversion|jsonparsed/i.test(
-          error.message,
-        ))
+        /unsupported|version|maxsupportedtransactionversion/i.test(error.message))
     ) {
       return rpcRequest<TransactionDetail | null>(
         endpoint,
@@ -257,147 +232,45 @@ export async function getTransaction(
         signal,
       );
     }
+
     throw error;
   }
-}
-
-export async function getTokenAccountsByOwner(
-  endpoint: string,
-  walletAddress: string,
-  signal?: AbortSignal,
-): Promise<TokenAccountByOwnerValue[]> {
-  const result = await rpcRequest<{ value: TokenAccountByOwnerValue[] }>(
-    endpoint,
-    "getTokenAccountsByOwner",
-    [
-      walletAddress,
-      { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" },
-      { encoding: "jsonParsed", commitment: "confirmed" },
-    ],
-    signal,
-  );
-  return result.value;
-}
-
-function formatRawTokenAmount(rawAmount: bigint, decimals: number): string {
-  if (decimals <= 0) {
-    return rawAmount.toString();
-  }
-
-  const negative = rawAmount < 0n;
-  const absolute = negative ? -rawAmount : rawAmount;
-  const padded = absolute.toString().padStart(decimals + 1, "0");
-  const whole = padded.slice(0, -decimals) || "0";
-  const fraction = padded.slice(-decimals).replace(/0+$/, "");
-  const display = fraction.length > 0 ? `${whole}.${fraction}` : whole;
-  return negative ? `-${display}` : display;
-}
-
-export function inferUiTokenBalances(
-  tokenAccounts: TokenAccountByOwnerValue[],
-): UiTokenBalanceRow[] {
-  const byMint = new Map<string, { rawAmount: bigint; decimals: number; accountCount: number }>();
-
-  for (const tokenAccount of tokenAccounts) {
-    const info = tokenAccount.account?.data?.parsed?.info;
-    const mint = info?.mint;
-    const tokenAmount = info?.tokenAmount;
-
-    if (
-      typeof mint !== "string" ||
-      !tokenAmount ||
-      typeof tokenAmount.amount !== "string" ||
-      typeof tokenAmount.decimals !== "number"
-    ) {
-      continue;
-    }
-
-    let rawAmount: bigint;
-    try {
-      rawAmount = BigInt(tokenAmount.amount);
-    } catch {
-      continue;
-    }
-
-    const existing = byMint.get(mint);
-    if (!existing) {
-      byMint.set(mint, {
-        rawAmount,
-        decimals: tokenAmount.decimals,
-        accountCount: 1,
-      });
-      continue;
-    }
-
-    byMint.set(mint, {
-      rawAmount: existing.rawAmount + rawAmount,
-      decimals: existing.decimals,
-      accountCount: existing.accountCount + 1,
-    });
-  }
-
-  return Array.from(byMint.entries())
-    .sort((left, right) => {
-      if (left[1].rawAmount === right[1].rawAmount) {
-        return left[0].localeCompare(right[0]);
-      }
-      return left[1].rawAmount > right[1].rawAmount ? -1 : 1;
-    })
-    .map(([mint, value]) => ({
-      mint,
-      amount: formatRawTokenAmount(value.rawAmount, value.decimals),
-      decimals: value.decimals,
-      accountCount: value.accountCount,
-    }));
 }
 
 function normalizeAccountKey(accountKey: RpcAccountKey): string {
   return typeof accountKey === "string" ? accountKey : accountKey.pubkey;
 }
 
-function inferCluster(endpoint: string): "mainnet-beta" | "devnet" | "testnet" {
-  const lower = endpoint.toLowerCase();
-  if (lower.includes("devnet")) {
-    return "devnet";
-  }
-  if (lower.includes("testnet")) {
-    return "testnet";
-  }
-  return "mainnet-beta";
-}
-
-function buildExplorerUrl(signature: string, endpoint: string): string {
-  const cluster = inferCluster(endpoint);
-  const url = `https://explorer.solana.com/tx/${signature}`;
-  return cluster === "mainnet-beta" ? url : `${url}?cluster=${cluster}`;
-}
-
-export function inferUiTxRow(
+export function inferTransactionRow(
   walletAddress: string,
   signatureInfo: SignatureInfo,
   detail: TransactionDetail | null,
-  endpoint: string,
+  explorerUrl: string,
+  detailUnavailable = false,
 ): UiTxRow {
   const meta = detail?.meta ?? null;
-  const accountKeys = detail?.transaction?.message?.accountKeys ?? [];
-  const preBalances = meta?.preBalances;
-  const postBalances = meta?.postBalances;
+  const accountKeys = detail?.transaction?.message?.accountKeys;
 
   let solChange: number | null = null;
-  let direction: UiTxRow["direction"] = "unknown";
+  let direction: TxDirection = "unknown";
 
-  if (Array.isArray(accountKeys) && Array.isArray(preBalances) && Array.isArray(postBalances)) {
+  if (
+    Array.isArray(accountKeys) &&
+    Array.isArray(meta?.preBalances) &&
+    Array.isArray(meta?.postBalances)
+  ) {
     const walletIndex = accountKeys.findIndex(
       (accountKey) => normalizeAccountKey(accountKey) === walletAddress,
     );
 
     if (
       walletIndex >= 0 &&
-      walletIndex < preBalances.length &&
-      walletIndex < postBalances.length
+      walletIndex < meta.preBalances.length &&
+      walletIndex < meta.postBalances.length
     ) {
-      const lamportDelta = postBalances[walletIndex] - preBalances[walletIndex];
+      const lamportDelta = meta.postBalances[walletIndex] - meta.preBalances[walletIndex];
       solChange = lamportDelta / LAMPORTS_PER_SOL;
+
       if (solChange > 0) {
         direction = "incoming";
       } else if (solChange < 0) {
@@ -406,7 +279,8 @@ export function inferUiTxRow(
     }
   }
 
-  let status: UiTxRow["status"] = "unknown";
+  let status: TxStatus = "unknown";
+
   if (meta && Object.prototype.hasOwnProperty.call(meta, "err")) {
     if (meta.err === null) {
       status = "success";
@@ -424,7 +298,8 @@ export function inferUiTxRow(
     direction,
     solChange,
     feeSol: typeof meta?.fee === "number" ? lamportsToSol(meta.fee) : null,
-    slot: typeof detail?.slot === "number" ? detail.slot : signatureInfo.slot ?? null,
-    explorerUrl: buildExplorerUrl(signatureInfo.signature, endpoint),
+    slot: typeof detail?.slot === "number" ? detail.slot : signatureInfo.slot,
+    explorerUrl,
+    detailUnavailable,
   };
 }

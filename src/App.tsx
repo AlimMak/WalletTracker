@@ -1,27 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { runWithConcurrency } from "./api/concurrency";
 import {
   type SignatureInfo,
-  type UiTokenBalanceRow,
   type UiTxRow,
-  type WalletInputState,
   RpcRequestError,
   getBalance,
   getSignaturesForAddress,
-  getTokenAccountsByOwner,
   getTransaction,
-  inferUiTokenBalances,
-  inferUiTxRow,
+  inferTransactionRow,
   isAbortError,
 } from "./api/solanaRpc";
 import { BalanceCard } from "./components/BalanceCard";
-import { TokenBalances } from "./components/TokenBalances";
-import { type RpcEndpointOption, WalletForm } from "./components/WalletForm";
+import { Header } from "./components/Header";
+import { KpiRow } from "./components/KpiRow";
+import { type RpcEndpointOption, SettingsPanel } from "./components/SettingsPanel";
+import { Toast } from "./components/Toast";
 import { TxTable } from "./components/TxTable";
+import { WalletForm } from "./components/WalletForm";
 import { lamportsToSol, sumKnownSolChanges } from "./utils/format";
+import { validateEndpointUrl, validateWalletAddress } from "./utils/validators";
 
-const SOLANA_ADDRESS_REGEX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-const CACHE_TTL_MS = 5 * 60 * 1000;
-const CACHE_KEY_PREFIX = "sol-wallet-tracker-cache:v1";
+const SOLSCAN_BASE_URL = "https://solscan.io";
+const SETTINGS_STORAGE_KEY = "sol-wallet-tracker:settings:v1";
 
 const RPC_ENDPOINT_OPTIONS: RpcEndpointOption[] = [
   {
@@ -42,629 +42,558 @@ const RPC_ENDPOINT_OPTIONS: RpcEndpointOption[] = [
   },
 ];
 
+type TxCountOption = 20 | 50;
+type ConcurrencyOption = 3 | 5;
+
+interface TrackerSettings {
+  endpointChoice: string;
+  customEndpoint: string;
+  txCount: TxCountOption;
+  concurrency: ConcurrencyOption;
+  showFailedTxs: boolean;
+}
+
 interface LoadProgress {
   loaded: number;
   total: number;
 }
 
-interface ActiveRequest {
-  id: number;
-  controller: AbortController;
+const DEFAULT_SETTINGS: TrackerSettings = {
+  endpointChoice: RPC_ENDPOINT_OPTIONS[0].value,
+  customEndpoint: "",
+  txCount: 20,
+  concurrency: 3,
+  showFailedTxs: true,
+};
+
+const ENDPOINT_VALUE_SET = new Set(RPC_ENDPOINT_OPTIONS.map((option) => option.value));
+
+function parseTxCount(value: unknown): TxCountOption {
+  return value === 50 ? 50 : 20;
 }
 
-interface CachedTxRow {
-  signature: string;
-  time: string | null;
-  status: UiTxRow["status"];
-  direction: UiTxRow["direction"];
-  solChange: number | null;
-  feeSol: number | null;
-  slot: number | null;
-  explorerUrl: string;
+function parseConcurrency(value: unknown): ConcurrencyOption {
+  return value === 5 ? 5 : 3;
 }
 
-interface CachedTokenBalanceRow {
-  mint: string;
-  amount: string;
-  decimals: number;
-  accountCount: number;
-}
-
-interface StoredCachedWalletData {
-  cachedAt: number;
-  balanceSol: number | null;
-  rows: CachedTxRow[];
-  tokenBalances: CachedTokenBalanceRow[];
-}
-
-interface WalletCacheData {
-  cachedAt: number;
-  balanceSol: number | null;
-  rows: UiTxRow[];
-  tokenBalances: UiTokenBalanceRow[];
-}
-
-function validateWalletAddress(address: string): string | null {
-  if (!address) {
-    return "Wallet address is required.";
+function readPersistedSettings(): TrackerSettings {
+  if (typeof window === "undefined") {
+    return DEFAULT_SETTINGS;
   }
-  if (!SOLANA_ADDRESS_REGEX.test(address)) {
-    return "Enter a valid Solana address (base58, 32-44 chars).";
-  }
-  return null;
-}
 
-function validateRpcEndpoint(endpoint: string): string | null {
-  if (!endpoint) {
-    return "RPC endpoint is required.";
-  }
+  let raw: string | null = null;
+
   try {
-    const url = new URL(endpoint);
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      return "RPC endpoint must start with http:// or https://.";
-    }
+    raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
   } catch {
-    return "Enter a valid RPC endpoint URL.";
+    return DEFAULT_SETTINGS;
   }
-  return null;
+
+  if (!raw) {
+    return DEFAULT_SETTINGS;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<TrackerSettings>;
+
+    return {
+      endpointChoice:
+        typeof parsed.endpointChoice === "string" && ENDPOINT_VALUE_SET.has(parsed.endpointChoice)
+          ? parsed.endpointChoice
+          : DEFAULT_SETTINGS.endpointChoice,
+      customEndpoint:
+        typeof parsed.customEndpoint === "string"
+          ? parsed.customEndpoint
+          : DEFAULT_SETTINGS.customEndpoint,
+      txCount: parseTxCount(parsed.txCount),
+      concurrency: parseConcurrency(parsed.concurrency),
+      showFailedTxs:
+        typeof parsed.showFailedTxs === "boolean"
+          ? parsed.showFailedTxs
+          : DEFAULT_SETTINGS.showFailedTxs,
+    };
+  } catch {
+    return DEFAULT_SETTINGS;
+  }
+}
+
+function persistSettings(settings: TrackerSettings): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // Ignore localStorage write errors.
+  }
+}
+
+function getEffectiveEndpoint(settings: TrackerSettings): string {
+  return settings.endpointChoice === "custom"
+    ? settings.customEndpoint.trim()
+    : settings.endpointChoice;
+}
+
+function txExplorerUrl(signature: string): string {
+  return `${SOLSCAN_BASE_URL}/tx/${signature}`;
+}
+
+function walletExplorerUrl(walletAddress: string): string {
+  return `${SOLSCAN_BASE_URL}/account/${walletAddress}`;
+}
+
+function makePlaceholderRow(signatureInfo: SignatureInfo): UiTxRow {
+  return {
+    signature: signatureInfo.signature,
+    time:
+      typeof signatureInfo.blockTime === "number"
+        ? new Date(signatureInfo.blockTime * 1000)
+        : null,
+    status: "unknown",
+    direction: "unknown",
+    solChange: null,
+    feeSol: null,
+    slot: signatureInfo.slot,
+    explorerUrl: txExplorerUrl(signatureInfo.signature),
+    detailUnavailable: false,
+  };
 }
 
 function getReadableError(error: unknown): string {
   if (error instanceof RpcRequestError) {
     if (error.isRateLimit) {
-      return "Rate-limited by the RPC endpoint. Try lower concurrency, fewer transactions, or a different RPC.";
+      return "Rate-limited by RPC. Try lower concurrency, fewer rows, or a different endpoint.";
     }
+
     if (error.isNetwork) {
-      return "RPC endpoint is unavailable or blocked. Check the endpoint URL and your network.";
+      return "RPC endpoint is unavailable. Check endpoint URL and network access.";
     }
+
     return `RPC error: ${error.message}`;
   }
+
   if (error instanceof Error) {
     return error.message;
   }
+
   return "Unexpected error while loading wallet data.";
 }
 
-function getCacheKey(walletAddress: string, endpoint: string, txLimit: number): string {
-  return `${CACHE_KEY_PREFIX}:${walletAddress}:${endpoint}:${txLimit}`;
-}
-
-function serializeTxRows(rows: UiTxRow[]): CachedTxRow[] {
-  return rows.map((row) => ({
-    signature: row.signature,
-    time: row.time ? row.time.toISOString() : null,
-    status: row.status,
-    direction: row.direction,
-    solChange: row.solChange,
-    feeSol: row.feeSol,
-    slot: row.slot,
-    explorerUrl: row.explorerUrl,
-  }));
-}
-
-function serializeTokenBalances(rows: UiTokenBalanceRow[]): CachedTokenBalanceRow[] {
-  return rows.map((row) => ({
-    mint: row.mint,
-    amount: row.amount,
-    decimals: row.decimals,
-    accountCount: row.accountCount,
-  }));
-}
-
-function parseFiniteOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function parseIntegerOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isInteger(value) ? value : null;
-}
-
-function deserializeTxRows(value: unknown): UiTxRow[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value
-    .map((item): UiTxRow | null => {
-      if (!item || typeof item !== "object") {
-        return null;
-      }
-
-      const row = item as Partial<CachedTxRow>;
-      if (
-        typeof row.signature !== "string" ||
-        typeof row.status !== "string" ||
-        typeof row.direction !== "string" ||
-        typeof row.explorerUrl !== "string"
-      ) {
-        return null;
-      }
-
-      const time =
-        typeof row.time === "string" && Number.isFinite(Date.parse(row.time))
-          ? new Date(row.time)
-          : null;
-      const status: UiTxRow["status"] =
-        row.status === "success" || row.status === "fail" || row.status === "unknown"
-          ? row.status
-          : "unknown";
-      const direction: UiTxRow["direction"] =
-        row.direction === "incoming" ||
-        row.direction === "outgoing" ||
-        row.direction === "unknown"
-          ? row.direction
-          : "unknown";
-
-      return {
-        signature: row.signature,
-        time,
-        status,
-        direction,
-        solChange: parseFiniteOrNull(row.solChange),
-        feeSol: parseFiniteOrNull(row.feeSol),
-        slot: parseFiniteOrNull(row.slot),
-        explorerUrl: row.explorerUrl,
-      };
-    })
-    .filter((row): row is UiTxRow => row !== null);
-}
-
-function deserializeTokenBalances(value: unknown): UiTokenBalanceRow[] {
-  if (!Array.isArray(value)) {
-    return [];
+async function copyTextToClipboard(value: string): Promise<boolean> {
+  if (!value) {
+    return false;
   }
 
-  return value
-    .map((item): UiTokenBalanceRow | null => {
-      if (!item || typeof item !== "object") {
-        return null;
-      }
-
-      const row = item as Partial<CachedTokenBalanceRow>;
-      const decimals = parseIntegerOrNull(row.decimals);
-      const accountCount = parseIntegerOrNull(row.accountCount);
-
-      if (
-        typeof row.mint !== "string" ||
-        typeof row.amount !== "string" ||
-        decimals === null ||
-        decimals < 0 ||
-        accountCount === null ||
-        accountCount < 0
-      ) {
-        return null;
-      }
-
-      return {
-        mint: row.mint,
-        amount: row.amount,
-        decimals,
-        accountCount,
-      };
-    })
-    .filter((row): row is UiTokenBalanceRow => row !== null);
-}
-
-function readWalletCache(
-  walletAddress: string,
-  endpoint: string,
-  txLimit: number,
-): WalletCacheData | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  const key = getCacheKey(walletAddress, endpoint, txLimit);
-  let raw: string | null = null;
-  try {
-    raw = window.localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-
-  if (!raw) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(raw) as Partial<StoredCachedWalletData>;
-    if (typeof parsed.cachedAt !== "number" || Date.now() - parsed.cachedAt > CACHE_TTL_MS) {
-      window.localStorage.removeItem(key);
-      return null;
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      // fall through
     }
-
-    return {
-      cachedAt: parsed.cachedAt,
-      balanceSol: parseFiniteOrNull(parsed.balanceSol),
-      rows: deserializeTxRows(parsed.rows),
-      tokenBalances: deserializeTokenBalances(parsed.tokenBalances),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function writeWalletCache(
-  walletAddress: string,
-  endpoint: string,
-  txLimit: number,
-  balanceSol: number | null,
-  rows: UiTxRow[],
-  tokenBalances: UiTokenBalanceRow[],
-): void {
-  if (typeof window === "undefined") {
-    return;
   }
 
-  const key = getCacheKey(walletAddress, endpoint, txLimit);
-  const payload: StoredCachedWalletData = {
-    cachedAt: Date.now(),
-    balanceSol,
-    rows: serializeTxRows(rows),
-    tokenBalances: serializeTokenBalances(tokenBalances),
-  };
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+
+  document.body.appendChild(textarea);
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+
+  let copied = false;
 
   try {
-    window.localStorage.setItem(key, JSON.stringify(payload));
+    copied = document.execCommand("copy");
   } catch {
-    // Ignore localStorage write errors (quota, privacy mode, etc.)
+    copied = false;
+  } finally {
+    document.body.removeChild(textarea);
   }
-}
 
-async function processWithConcurrency<T>(
-  items: T[],
-  concurrency: number,
-  worker: (item: T, index: number) => Promise<void>,
-  signal: AbortSignal,
-): Promise<void> {
-  const limit = Math.max(1, concurrency);
-  let nextIndex = 0;
-
-  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (true) {
-      if (signal.aborted) {
-        return;
-      }
-      const currentIndex = nextIndex++;
-      if (currentIndex >= items.length) {
-        return;
-      }
-      await worker(items[currentIndex], currentIndex);
-    }
-  });
-
-  await Promise.all(runners);
+  return copied;
 }
 
 export default function App() {
-  const [walletState, setWalletState] = useState<WalletInputState>({
-    address: "",
-    isValid: false,
-    error: null,
-  });
-  const [selectedEndpoint, setSelectedEndpoint] = useState<string>(
-    "https://api.mainnet-beta.solana.com",
-  );
-  const [customEndpoint, setCustomEndpoint] = useState<string>("");
-  const [txLimit, setTxLimit] = useState<number>(20);
-  const [concurrency, setConcurrency] = useState<number>(3);
+  const [settings, setSettings] = useState<TrackerSettings>(() => readPersistedSettings());
+
+  const [walletAddress, setWalletAddress] = useState("");
+  const [walletError, setWalletError] = useState<string | null>(null);
+  const [customEndpointError, setCustomEndpointError] = useState<string | null>(null);
 
   const [balanceSol, setBalanceSol] = useState<number | null>(null);
-  const [tokenBalances, setTokenBalances] = useState<UiTokenBalanceRow[]>([]);
   const [rows, setRows] = useState<UiTxRow[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
+  const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState<LoadProgress>({ loaded: 0, total: 0 });
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [tokenError, setTokenError] = useState<string | null>(null);
-  const [partialFailures, setPartialFailures] = useState<number>(0);
-  const [isCachedData, setIsCachedData] = useState<boolean>(false);
+  const [partialFailures, setPartialFailures] = useState(0);
+  const [rpcError, setRpcError] = useState<string | null>(null);
 
-  const activeRequestRef = useRef<ActiveRequest | null>(null);
-  const requestCounterRef = useRef<number>(0);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  const effectiveEndpoint =
-    selectedEndpoint === "custom" ? customEndpoint.trim() : selectedEndpoint;
+  const activeControllerRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef(0);
+  const lastTrackedWalletRef = useRef("");
+  const toastTimerRef = useRef<number | null>(null);
 
-  const netSolChange = useMemo(() => sumKnownSolChanges(rows), [rows]);
-  const knownChangeCount = useMemo(
-    () => rows.filter((row) => row.solChange !== null).length,
-    [rows],
+  const effectiveEndpoint = getEffectiveEndpoint(settings);
+
+  const displayedRows = useMemo(
+    () =>
+      settings.showFailedTxs ? rows : rows.filter((row) => row.status !== "fail"),
+    [rows, settings.showFailedTxs],
   );
 
-  function isCurrentRequest(requestId: number): boolean {
-    return activeRequestRef.current?.id === requestId;
-  }
+  const knownDeltaCount = useMemo(
+    () => displayedRows.filter((row) => row.solChange !== null).length,
+    [displayedRows],
+  );
 
-  function cancelActiveRequest(): void {
-    if (activeRequestRef.current) {
-      activeRequestRef.current.controller.abort();
-      activeRequestRef.current = null;
+  const netSolChange = useMemo(() => sumKnownSolChanges(displayedRows), [displayedRows]);
+
+  const successRate = useMemo(() => {
+    const terminalRows = displayedRows.filter(
+      (row) => row.status === "success" || row.status === "fail",
+    );
+
+    if (terminalRows.length === 0) {
+      return null;
     }
-  }
 
-  function resetResults(clearAddress: boolean): void {
-    cancelActiveRequest();
-    setLoading(false);
-    setBalanceSol(null);
-    setTokenBalances([]);
-    setRows([]);
-    setProgress({ loaded: 0, total: 0 });
-    setPartialFailures(0);
-    setErrorMessage(null);
-    setTokenError(null);
-    setIsCachedData(false);
-    if (clearAddress) {
-      setWalletState({
-        address: "",
-        isValid: false,
-        error: null,
-      });
+    const successCount = terminalRows.filter((row) => row.status === "success").length;
+    return (successCount / terminalRows.length) * 100;
+  }, [displayedRows]);
+
+  const headerStatus: "connected" | "degraded" =
+    rpcError || partialFailures > 0 ? "degraded" : "connected";
+
+  const normalizedWallet = walletAddress.trim();
+
+  const resolvedWalletExplorerUrl = useMemo(() => {
+    if (validateWalletAddress(normalizedWallet) !== null) {
+      return null;
     }
-  }
 
-  async function fetchWalletData(
-    walletAddress: string,
-    options?: { preserveExistingData?: boolean; cachedTokenBalances?: UiTokenBalanceRow[] },
-  ): Promise<void> {
-    const preserveExistingData = Boolean(options?.preserveExistingData);
-    const cachedTokenBalances = options?.cachedTokenBalances ?? [];
-    const newRequest: ActiveRequest = {
-      id: ++requestCounterRef.current,
-      controller: new AbortController(),
+    return walletExplorerUrl(normalizedWallet);
+  }, [normalizedWallet]);
+
+  const retryWallet = lastTrackedWalletRef.current || normalizedWallet;
+
+  useEffect(() => {
+    persistSettings(settings);
+  }, [settings]);
+
+  useEffect(() => {
+    return () => {
+      if (activeControllerRef.current) {
+        activeControllerRef.current.abort();
+      }
+
+      if (toastTimerRef.current !== null) {
+        window.clearTimeout(toastTimerRef.current);
+      }
     };
-    activeRequestRef.current = newRequest;
+  }, []);
 
-    setLoading(true);
-    setErrorMessage(null);
-    setTokenError(null);
-    setPartialFailures(0);
-    if (!preserveExistingData) {
-      setRows([]);
-      setProgress({ loaded: 0, total: 0 });
-      setBalanceSol(null);
-      setTokenBalances([]);
-      setIsCachedData(false);
+  function showToast(message: string): void {
+    setToastMessage(message);
+
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
     }
+
+    toastTimerRef.current = window.setTimeout(() => {
+      setToastMessage(null);
+      toastTimerRef.current = null;
+    }, 1500);
+  }
+
+  function abortActiveRequest(): void {
+    if (activeControllerRef.current) {
+      activeControllerRef.current.abort();
+      activeControllerRef.current = null;
+    }
+
+    requestIdRef.current += 1;
+  }
+
+  function isCurrentRequest(requestId: number): boolean {
+    return requestIdRef.current === requestId;
+  }
+
+  async function handleTrack(addressOverride?: string): Promise<void> {
+    const targetWallet = (addressOverride ?? walletAddress).trim();
+    const nextWalletError = validateWalletAddress(targetWallet);
+    const nextEndpointError = validateEndpointUrl(effectiveEndpoint);
+
+    setWalletError(nextWalletError);
+    setCustomEndpointError(settings.endpointChoice === "custom" ? nextEndpointError : null);
+
+    if (nextWalletError || nextEndpointError) {
+      setRpcError(nextEndpointError ?? null);
+      return;
+    }
+
+    setWalletAddress(targetWallet);
+    setRpcError(null);
+    setPartialFailures(0);
+    setProgress({ loaded: 0, total: 0 });
+    setRows([]);
+    setBalanceSol(null);
+    setLoading(true);
+
+    lastTrackedWalletRef.current = targetWallet;
+
+    abortActiveRequest();
+
+    const requestId = requestIdRef.current;
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
 
     try {
       const balanceLamports = await getBalance(
         effectiveEndpoint,
-        walletAddress,
-        newRequest.controller.signal,
+        targetWallet,
+        controller.signal,
       );
-      const fetchedBalanceSol = lamportsToSol(balanceLamports);
-      if (!isCurrentRequest(newRequest.id)) {
+
+      if (!isCurrentRequest(requestId)) {
         return;
       }
-      setBalanceSol(fetchedBalanceSol);
 
-      let fetchedTokenBalances = cachedTokenBalances;
-      try {
-        const tokenAccounts = await getTokenAccountsByOwner(
-          effectiveEndpoint,
-          walletAddress,
-          newRequest.controller.signal,
-        );
-        if (!isCurrentRequest(newRequest.id)) {
-          return;
-        }
-        fetchedTokenBalances = inferUiTokenBalances(tokenAccounts);
-        setTokenBalances(fetchedTokenBalances);
-      } catch (error) {
-        if (isAbortError(error)) {
-          throw error;
-        }
-        if (!isCurrentRequest(newRequest.id)) {
-          return;
-        }
-        setTokenError(getReadableError(error));
-        if (!preserveExistingData) {
-          fetchedTokenBalances = [];
-          setTokenBalances([]);
-        }
-      }
+      setBalanceSol(lamportsToSol(balanceLamports));
 
       const signatures = await getSignaturesForAddress(
         effectiveEndpoint,
-        walletAddress,
-        txLimit,
-        newRequest.controller.signal,
+        targetWallet,
+        settings.txCount,
+        controller.signal,
       );
-      if (!isCurrentRequest(newRequest.id)) {
+
+      if (!isCurrentRequest(requestId)) {
         return;
       }
 
       setProgress({ loaded: 0, total: signatures.length });
+      setRows(signatures.map((signature) => makePlaceholderRow(signature)));
+
       if (signatures.length === 0) {
-        setRows([]);
-        writeWalletCache(
-          walletAddress,
-          effectiveEndpoint,
-          txLimit,
-          fetchedBalanceSol,
-          [],
-          fetchedTokenBalances,
-        );
-        setIsCachedData(false);
         return;
       }
 
-      const nextRows: Array<UiTxRow | null> = new Array(signatures.length).fill(null);
       let loaded = 0;
-      let failedCount = 0;
-      let finalRows: UiTxRow[] = [];
+      let failed = 0;
 
-      await processWithConcurrency<SignatureInfo>(
-        signatures,
-        concurrency,
-        async (signatureInfo, index) => {
+      await runWithConcurrency({
+        items: signatures,
+        concurrency: settings.concurrency,
+        signal: controller.signal,
+        worker: async (signatureInfo, index) => {
           let nextRow: UiTxRow;
+
           try {
             const detail = await getTransaction(
               effectiveEndpoint,
               signatureInfo.signature,
-              newRequest.controller.signal,
+              controller.signal,
             );
-            nextRow = inferUiTxRow(walletAddress, signatureInfo, detail, effectiveEndpoint);
+            const unavailable = detail === null;
+
+            if (unavailable) {
+              failed += 1;
+            }
+
+            nextRow = inferTransactionRow(
+              targetWallet,
+              signatureInfo,
+              detail,
+              txExplorerUrl(signatureInfo.signature),
+              unavailable,
+            );
           } catch (error) {
             if (isAbortError(error)) {
               throw error;
             }
-            failedCount += 1;
-            nextRow = inferUiTxRow(walletAddress, signatureInfo, null, effectiveEndpoint);
+
+            failed += 1;
+            nextRow = inferTransactionRow(
+              targetWallet,
+              signatureInfo,
+              null,
+              txExplorerUrl(signatureInfo.signature),
+              true,
+            );
           }
 
-          if (!isCurrentRequest(newRequest.id)) {
+          if (!isCurrentRequest(requestId)) {
             return;
           }
 
-          nextRows[index] = nextRow;
           loaded += 1;
-          finalRows = nextRows.filter((row): row is UiTxRow => row !== null);
-          setProgress({ loaded, total: signatures.length });
-          setPartialFailures(failedCount);
-          setRows(finalRows);
-        },
-        newRequest.controller.signal,
-      );
 
-      if (isCurrentRequest(newRequest.id)) {
-        writeWalletCache(
-          walletAddress,
-          effectiveEndpoint,
-          txLimit,
-          fetchedBalanceSol,
-          finalRows,
-          fetchedTokenBalances,
-        );
-        setIsCachedData(false);
-      }
+          setRows((currentRows) => {
+            const nextRows = [...currentRows];
+            nextRows[index] = nextRow;
+            return nextRows;
+          });
+
+          setProgress({ loaded, total: signatures.length });
+          setPartialFailures(failed);
+        },
+      });
     } catch (error) {
-      if (!isCurrentRequest(newRequest.id)) {
+      if (!isCurrentRequest(requestId)) {
         return;
       }
+
       if (!isAbortError(error)) {
-        setErrorMessage(getReadableError(error));
+        setRpcError(getReadableError(error));
       }
     } finally {
-      if (isCurrentRequest(newRequest.id)) {
+      if (isCurrentRequest(requestId)) {
         setLoading(false);
-        activeRequestRef.current = null;
+        activeControllerRef.current = null;
       }
     }
-  }
-
-  function handleAddressChange(value: string): void {
-    const trimmed = value.trim();
-    const error = trimmed.length === 0 ? null : validateWalletAddress(trimmed);
-    setWalletState({
-      address: value,
-      isValid: !error && trimmed.length > 0,
-      error,
-    });
-  }
-
-  async function handleTrackWallet(): Promise<void> {
-    const walletAddress = walletState.address.trim();
-    const walletError = validateWalletAddress(walletAddress);
-    const endpointError = validateRpcEndpoint(effectiveEndpoint);
-
-    if (walletError || endpointError) {
-      setWalletState({
-        address: walletState.address,
-        isValid: false,
-        error: walletError,
-      });
-      setErrorMessage(endpointError);
-      return;
-    }
-
-    const cached = readWalletCache(walletAddress, effectiveEndpoint, txLimit);
-    cancelActiveRequest();
-
-    if (cached) {
-      setBalanceSol(cached.balanceSol);
-      setTokenBalances(cached.tokenBalances);
-      setRows(cached.rows);
-      setProgress({ loaded: cached.rows.length, total: cached.rows.length });
-      setPartialFailures(0);
-      setErrorMessage(null);
-      setTokenError(null);
-      setIsCachedData(true);
-    }
-
-    await fetchWalletData(walletAddress, {
-      preserveExistingData: Boolean(cached),
-      cachedTokenBalances: cached?.tokenBalances ?? [],
-    });
-  }
-
-  function handleCancel(): void {
-    cancelActiveRequest();
-    setLoading(false);
   }
 
   function handleReset(): void {
-    resetResults(true);
+    abortActiveRequest();
+
+    setWalletAddress("");
+    setWalletError(null);
+    setCustomEndpointError(null);
+    setBalanceSol(null);
+    setRows([]);
+    setProgress({ loaded: 0, total: 0 });
+    setPartialFailures(0);
+    setRpcError(null);
+    setLoading(false);
+
+    lastTrackedWalletRef.current = "";
   }
 
-  useEffect(() => {
-    return () => {
-      cancelActiveRequest();
-    };
-  }, []);
+  function handleWalletChange(value: string): void {
+    setWalletAddress(value);
+
+    const trimmed = value.trim();
+    setWalletError(trimmed.length === 0 ? null : validateWalletAddress(trimmed));
+  }
+
+  async function handleCopyWallet(): Promise<void> {
+    const value = walletAddress.trim();
+
+    if (!value) {
+      return;
+    }
+
+    const copied = await copyTextToClipboard(value);
+    showToast(copied ? "Wallet copied" : "Copy failed");
+  }
+
+  async function handleCopySignature(signature: string): Promise<void> {
+    const copied = await copyTextToClipboard(signature);
+    showToast(copied ? "Signature copied" : "Copy failed");
+  }
 
   return (
-    <div className="app-shell">
-      <WalletForm
-        walletState={walletState}
-        onAddressChange={handleAddressChange}
-        onSubmit={() => {
-          void handleTrackWallet();
-        }}
-        onCancel={handleCancel}
-        onReset={handleReset}
-        loading={loading}
-        endpointOptions={RPC_ENDPOINT_OPTIONS}
-        endpointValue={selectedEndpoint}
-        onEndpointChange={setSelectedEndpoint}
-        customEndpoint={customEndpoint}
-        onCustomEndpointChange={setCustomEndpoint}
-        txLimit={txLimit}
-        onTxLimitChange={setTxLimit}
-        concurrency={concurrency}
-        onConcurrencyChange={setConcurrency}
-      />
+    <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+      <div className="space-y-4">
+        <Header status={headerStatus} />
 
-      {errorMessage && (
-        <section className="panel error-panel">
-          <p className="error-text">{errorMessage}</p>
-        </section>
-      )}
+        <WalletForm
+          walletAddress={walletAddress}
+          walletError={walletError}
+          loading={loading}
+          onAddressChange={handleWalletChange}
+          onTrack={() => {
+            void handleTrack();
+          }}
+          onReset={handleReset}
+        />
 
-      <BalanceCard
-        walletAddress={walletState.address.trim()}
-        balanceSol={balanceSol}
-        loading={loading}
-        isCachedData={isCachedData}
-      />
+        <SettingsPanel
+          endpointOptions={RPC_ENDPOINT_OPTIONS}
+          endpointChoice={settings.endpointChoice}
+          customEndpoint={settings.customEndpoint}
+          customEndpointError={customEndpointError}
+          txCount={settings.txCount}
+          concurrency={settings.concurrency}
+          showFailedTxs={settings.showFailedTxs}
+          onEndpointChoiceChange={(value) => {
+            setSettings((current) => ({ ...current, endpointChoice: value }));
+            setCustomEndpointError(null);
+          }}
+          onCustomEndpointChange={(value) => {
+            setSettings((current) => ({ ...current, customEndpoint: value }));
+            setCustomEndpointError(null);
+          }}
+          onTxCountChange={(value) => {
+            setSettings((current) => ({ ...current, txCount: value }));
+          }}
+          onConcurrencyChange={(value) => {
+            setSettings((current) => ({ ...current, concurrency: value }));
+          }}
+          onShowFailedChange={(value) => {
+            setSettings((current) => ({ ...current, showFailedTxs: value }));
+          }}
+        />
 
-      <TokenBalances
-        rows={tokenBalances}
-        loading={loading}
-        errorMessage={tokenError}
-        isCachedData={isCachedData}
-      />
+        {rpcError && (
+          <section className="app-panel border-amber-500/30 bg-amber-500/10 p-4 sm:p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.14em] text-amber-300">Degraded RPC</p>
+                <p className="mt-1 text-sm text-amber-100">{rpcError}</p>
+              </div>
 
-      <TxTable
-        rows={rows}
-        loading={loading}
-        loadedCount={progress.loaded}
-        totalCount={progress.total}
-        netSolChange={netSolChange}
-        knownChangeCount={knownChangeCount}
-        partialFailures={partialFailures}
-        isCachedData={isCachedData}
-      />
-    </div>
+              <button
+                type="button"
+                disabled={loading || retryWallet.length === 0}
+                onClick={() => {
+                  void handleTrack(retryWallet);
+                }}
+                className="rounded-lg border border-amber-400/35 bg-amber-500/15 px-3 py-2 text-xs font-medium text-amber-100 transition hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Retry
+              </button>
+            </div>
+          </section>
+        )}
+
+        <BalanceCard
+          walletAddress={normalizedWallet}
+          balanceSol={balanceSol}
+          loading={loading}
+          walletExplorerUrl={resolvedWalletExplorerUrl}
+          onCopyWallet={() => {
+            void handleCopyWallet();
+          }}
+        />
+
+        <KpiRow
+          txFetched={displayedRows.length}
+          successRate={successRate}
+          netSolChange={netSolChange}
+          knownDeltaCount={knownDeltaCount}
+        />
+
+        <TxTable
+          rows={displayedRows}
+          loading={loading}
+          loadedCount={progress.loaded}
+          totalCount={progress.total}
+          partialFailures={partialFailures}
+          onCopySignature={(signature) => {
+            void handleCopySignature(signature);
+          }}
+        />
+      </div>
+
+      <Toast message={toastMessage} />
+    </main>
   );
 }

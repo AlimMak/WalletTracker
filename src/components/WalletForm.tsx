@@ -1,131 +1,61 @@
-import type { WalletInputState } from "../api/solanaRpc";
-
-export interface RpcEndpointOption {
-  label: string;
-  value: string;
-}
-
 interface WalletFormProps {
-  walletState: WalletInputState;
-  onAddressChange: (value: string) => void;
-  onSubmit: () => void;
-  onCancel: () => void;
-  onReset: () => void;
+  walletAddress: string;
+  walletError: string | null;
   loading: boolean;
-  endpointOptions: RpcEndpointOption[];
-  endpointValue: string;
-  onEndpointChange: (value: string) => void;
-  customEndpoint: string;
-  onCustomEndpointChange: (value: string) => void;
-  txLimit: number;
-  onTxLimitChange: (value: number) => void;
-  concurrency: number;
-  onConcurrencyChange: (value: number) => void;
+  onAddressChange: (value: string) => void;
+  onTrack: () => void;
+  onReset: () => void;
 }
 
 export function WalletForm({
-  walletState,
-  onAddressChange,
-  onSubmit,
-  onCancel,
-  onReset,
+  walletAddress,
+  walletError,
   loading,
-  endpointOptions,
-  endpointValue,
-  onEndpointChange,
-  customEndpoint,
-  onCustomEndpointChange,
-  txLimit,
-  onTxLimitChange,
-  concurrency,
-  onConcurrencyChange,
+  onAddressChange,
+  onTrack,
+  onReset,
 }: WalletFormProps) {
   return (
-    <section className="panel">
-      <h1>Solana Wallet Tracker</h1>
-      <p className="subtle">
-        Paste a wallet address to view current balance and recent transaction deltas.
-      </p>
+    <section className="app-panel p-5 sm:p-6">
+      <div className="mb-4">
+        <h2 className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">Track Wallet</h2>
+        <p className="mt-1 text-sm text-slate-500">
+          Enter a Solana wallet to fetch SOL balance and recent transaction activity.
+        </p>
+      </div>
 
       <form
-        className="wallet-form"
         onSubmit={(event) => {
           event.preventDefault();
-          onSubmit();
+          onTrack();
         }}
+        className="grid gap-3 sm:grid-cols-[1fr_auto_auto]"
       >
-        <label htmlFor="walletAddress">Wallet Address</label>
-        <input
-          id="walletAddress"
-          name="walletAddress"
-          placeholder="Enter Solana address..."
-          autoComplete="off"
-          spellCheck={false}
-          value={walletState.address}
-          onChange={(event) => onAddressChange(event.target.value)}
-        />
-        {walletState.error && <p className="error-text">{walletState.error}</p>}
-
-        <div className="settings-grid">
-          <label>
-            RPC Endpoint
-            <select
-              value={endpointValue}
-              onChange={(event) => onEndpointChange(event.target.value)}
-            >
-              {endpointOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <label>
-            Transactions
-            <select
-              value={txLimit}
-              onChange={(event) => onTxLimitChange(Number(event.target.value))}
-            >
-              <option value={20}>20</option>
-              <option value={50}>50</option>
-            </select>
-          </label>
-
-          <label>
-            Concurrency
-            <select
-              value={concurrency}
-              onChange={(event) => onConcurrencyChange(Number(event.target.value))}
-            >
-              <option value={3}>3</option>
-              <option value={5}>5</option>
-            </select>
-          </label>
+        <div>
+          <input
+            value={walletAddress}
+            onChange={(event) => onAddressChange(event.target.value)}
+            placeholder="Paste Solana wallet address"
+            className="app-input font-mono"
+          />
+          {walletError && <p className="mt-1.5 text-xs text-rose-400">{walletError}</p>}
         </div>
 
-        {endpointValue === "custom" && (
-          <label>
-            Custom RPC URL
-            <input
-              placeholder="https://..."
-              value={customEndpoint}
-              onChange={(event) => onCustomEndpointChange(event.target.value)}
-            />
-          </label>
-        )}
+        <button
+          type="submit"
+          disabled={loading}
+          className="rounded-xl bg-[color:var(--accent)] px-4 py-2.5 text-sm font-semibold text-[#032012] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {loading ? "Tracking..." : "Track"}
+        </button>
 
-        <div className="button-row">
-          <button type="submit" disabled={loading}>
-            {loading ? "Tracking..." : "Track Wallet"}
-          </button>
-          <button type="button" className="secondary" onClick={onCancel} disabled={!loading}>
-            Cancel
-          </button>
-          <button type="button" className="secondary" onClick={onReset}>
-            Reset
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={onReset}
+          className="rounded-xl border border-[color:var(--border)] bg-[#0f1622] px-4 py-2.5 text-sm font-medium text-slate-300 transition hover:bg-[#141f2f]"
+        >
+          Reset
+        </button>
       </form>
     </section>
   );

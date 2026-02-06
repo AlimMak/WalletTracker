@@ -1,42 +1,83 @@
 # Solana Wallet Tracker (Frontend Only)
 
-Small React + TypeScript app (Vite) to track a Solana wallet using public JSON-RPC endpoints.
+Production-quality dark dashboard for tracking a Solana wallet from public JSON-RPC endpoints.
 
-## 1) Setup
+## Stack
 
-1. Ensure Node.js 18+ is installed.
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Start local dev server:
-   ```bash
-   npm run dev
-   ```
-4. Open the local URL printed by Vite (usually `http://localhost:5173`).
+- React + TypeScript (Vite)
+- Tailwind CSS
+- Frontend-only RPC calls (`getBalance`, `getSignaturesForAddress`, `getTransaction`)
 
-## 2) Build
+## Setup
+
+1. Install dependencies:
+
+```bash
+npm install
+```
+
+2. Run the development server:
+
+```bash
+npm run dev
+```
+
+3. Build production assets:
 
 ```bash
 npm run build
 ```
 
-## 3) Project structure
+4. Preview production build:
+
+```bash
+npm run preview
+```
+
+## Required folder structure
 
 ```text
 src/
-  api/solanaRpc.ts
-  utils/format.ts
+  api/
+    solanaRpc.ts
+    concurrency.ts
+  utils/
+    format.ts
+    validators.ts
   components/
+    Header.tsx
     WalletForm.tsx
+    SettingsPanel.tsx
     BalanceCard.tsx
+    KpiRow.tsx
     TxTable.tsx
+    Toast.tsx
   App.tsx
   main.tsx
+  index.css
 ```
 
-## 4) Notes
+## Direction + SOL delta inference
 
-- Default endpoint is mainnet-beta (`https://api.mainnet-beta.solana.com`).
-- App uses `getBalance`, `getSignaturesForAddress`, then `getTransaction` with a concurrency cap.
-- If transaction details are missing or fail, row fields fall back to `unknown` (best effort, no guessing).
+For each fetched signature, the app requests `getTransaction` and then:
+
+1. Finds `walletIndex` in `transaction.message.accountKeys` matching the tracked wallet.
+2. If index exists and `meta.preBalances` + `meta.postBalances` are present:
+   - `lamportDelta = postBalances[walletIndex] - preBalances[walletIndex]`
+   - `solChange = lamportDelta / 1e9`
+   - direction:
+     - `solChange > 0` => incoming
+     - `solChange < 0` => outgoing
+     - `solChange === 0` => unknown
+3. If metadata is missing, `solChange = null` and direction = unknown.
+4. Status:
+   - `meta.err === null` => success
+   - `meta.err` exists => fail
+   - otherwise unknown
+5. Fee from `meta.fee / 1e9` when available.
+
+## Known limitations
+
+- Direction and SOL delta are wallet-native balance deltas only; they do not classify token swaps/bridges semantically.
+- `getTransaction` can return `null` on some RPC nodes or old slots, shown as `detail unavailable`.
+- Public RPC endpoints may rate limit; use lower concurrency or another endpoint when degraded.
